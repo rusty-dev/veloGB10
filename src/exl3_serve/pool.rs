@@ -63,9 +63,21 @@ impl Exl3Scheduler {
     /// first agrees that shifting entries out CAN make room.
     pub(super) fn pool_capture_slot(&mut self, slot: usize, old: &[u32]) -> Result<bool> {
         if !self.pool.on() { return Ok(false); }
-        // text only (image rows carry ids >= 2^31 and per-lane vision rope rows a snapshot does not hold);
+        // PFXPOOL4 (2026-11-22): image-bearing prompts ARE capturable. The old skip ("image rows carry ids >= 2^31
+        // and per-lane vision rope rows a snapshot does not hold") was wrong about the engine: main-attention RoPE
+        // is applied at ROW WRITE (cos_gather feeds the new rows' positions; the row slab keeps rotated K — the
+        // spill tier ships those exact bytes for image prompts today), and the per-slot vision arm (rope_map /
+        // rope_plen / rope_delta / mrope_tab) is REQUEST-scoped: admit_req arms it via vision_setup/clear_slot_vision
+        // for the FULL new prompt BEFORE prefill_plan reaches any restore, so a restored lane holds its own correct
+        // rope rows for the whole new prompt — suffix prefill and decode included. Key identity carries the rest:
+        // image rows key on pixel-hash + intra-span index (image_row_key), and mrope_positions gives prefix rows
+        // the same 3-axis positions (and the prompt the same delta) under any extension — key equality therefore
+        // means "same images, same span positions" = the rows a fresh prefill would produce, the same contract the
+        // own-lane snapshot and the spill tier already use for image prompts. A re-render that drops or moves the
+        // images simply mismatches at the first changed row: best() then resumes at whatever shallower checkpoint
+        // it can PROVE, never deeper.
         // short prompts are cheaper to read again than to keep
-        if old.len() < POOL_MIN_TOKENS || old.iter().any(|&t| t >= 0x8000_0000) {
+        if old.len() < POOL_MIN_TOKENS {
             crate::metrics::pfx_pool_skip();
             return Ok(false);
         }
@@ -113,7 +125,20 @@ impl Exl3Scheduler {
         // the cap: shift out least recently used entries; their slabs become spares
         let mut nev = 0u64;
         loop {
-            let ev = self.pool.make_room(bytes);
+            // PFXPOOL3: `make_room` evicts ascending re-prefill cost and REFUSES (None, pool untouched) when the
+            // only families it could empty are deeper than this capture — the entrant is cheaper to re-read than
+            // they are, so it is not kept rather than displacing them (the 551-token helper / 215k session case).
+            let ev = match self.pool.make_room(bytes, n) {
+                Some(ev) => ev,
+                None => {
+                    crate::metrics::pfx_pool_refused();
+                    self.pool_publish();
+                    crate::drprintln!("[exl3-serve] prefix pool: {n} tokens not kept (room here would cost a deeper \
+                                       entry than it: {} entries, {} of {} MiB untouched)",
+                                      self.pool.len(), self.pool.bytes() >> 20, self.pool.cap_bytes() >> 20);
+                    return Ok(false);
+                }
+            };
             nev += ev.len() as u64;
             for e in ev { if let Some(b) = e.buf.buf { self.pool_spare.push(b); } }
             if parent.map_or(false, |(id, _)| self.pool.index_of(id).is_none()) {
@@ -324,7 +349,9 @@ impl Exl3Scheduler {
     /// on a single box. PFXPOOL2: rows come through the entry's parent chain, the recurrent state from the entry; the
     /// lane's row lineage becomes the entry's.
     pub(super) fn pool_restore_slot(&mut self, slot: usize, key: &[u32], end: usize, own_q: usize) -> Result<Option<PoolHit>> {
-        if !self.pool.on() || self.pool.is_empty() || key.iter().any(|&t| t >= 0x8000_0000) {
+        // PFXPOOL4: image-bearing keys restore like text ones (see `pool_capture_slot`: the vision arm is
+        // request-scoped and armed for this prompt already; a key mismatch truncates the resume, never a wrong one)
+        if !self.pool.on() || self.pool.is_empty() {
             return Ok(None);
         }
         let c = self.chunk.max(1);
@@ -417,8 +444,20 @@ impl Exl3Scheduler {
     /// next lockstep's 'transport already aborted' message replaced it).
     pub(super) fn spill_capture_slot(&mut self, slot: usize, old: &[u32]) -> Result<()> {
         let Some(st) = self.spill.clone() else { return Ok(()) };
-        let key = crate::kv_spill::conv_key(old);
+        let key = crate::kv_spill::conv_key(&old);
         let tokens = old.len() as u64;
+        // SPILLTRUNC: the lane's checkpoints for THIS conversation ride the file (spill_capture): a later
+        // prompt that is a truncated prefix of `old` restores rows + one of these instead of re-prefilling.
+        // ckpts_under replays the WP16 store's retention on `old` (deterministic from replicated inputs — the
+        // positions every rank computes are the positions the store actually holds), and prefix_keys is the
+        // same FNV every later lookup_at replays. Empty on WP16 lanes (pure-GDN captures keep v6 semantics).
+        let (c0, ckrefs) = self.wp16
+            .as_ref()
+            .map_or((0usize, Vec::new()), |st| st.ckpts_under(slot, &old, old.len()));
+        let poss: Vec<u64> = ckrefs.iter().map(|(p, _)| *p as u64).collect();
+        let keys = crate::kv_spill::prefix_keys(&old, &poss);
+        let cks: Vec<(u64, u64, &crate::exl3_forward::RecurCkpt)> =
+            ckrefs.iter().zip(&keys).map(|((p, b), k)| (*p as u64, *k, *b)).collect();
         // LANERES3 (TP>=2): every decision in this hook must come out IDENTICALLY on all
         // ranks — the policy state it feeds decides future restores in lockstep. So under
         // TP the budget gate reads the deterministic policy bytes (not the live writer
@@ -436,11 +475,14 @@ impl Exl3Scheduler {
                 return Ok(());
             }
             let mut buf = Vec::new();
-            if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
-                crate::metrics::kv_spill_miss_recompute();
-                crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
-                return Ok(());
-            }
+            let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
+                Ok(f) => f,
+                Err(e) => {
+                    crate::metrics::kv_spill_miss_recompute();
+                    crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                    return Ok(());
+                }
+            };
             crate::kv_spill::finalize_header(&mut buf, tokens);
             let wrote = st.put_sync(key, self.spill_rank, &buf);
             let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(wrote.is_ok())) {
@@ -455,8 +497,24 @@ impl Exl3Scheduler {
                 return Ok(());
             }
             let bytes = wrote.unwrap_or(0);
-            for v in self.spill_pol.put(key, bytes, tokens) {
+            let snap = crate::kv_spill::Snap {
+                conv: key,
+                bytes,
+                tokens,
+                fixed,
+                ck_c: c0,
+                ck: cks.iter().map(|(p, k, _)| (*p, *k)).collect(),
+            };
+            for v in self.spill_pol.put_snap(snap) {
                 st.remove(v, self.spill_rank);
+            }
+            if !self.spill_pol.contains(key) {
+                // SPILLDUR2: the cost-weighted cap refused the entrant (admitting it would displace a deeper
+                // snapshot) — the just-written file is not tracked, so it is deleted rather than orphaned. The
+                // policy state is replicated: every rank reaches this branch identically.
+                st.remove(key, self.spill_rank);
+                crate::drprintln!("[kv-spill] capture not kept: admitting {tokens} tokens would evict deeper snapshots");
+                return Ok(());
             }
             crate::metrics::kv_spill_write(bytes, tokens);
             return Ok(());
@@ -475,16 +533,33 @@ impl Exl3Scheduler {
             }
         }
         let mut buf = Vec::new();
-        if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
-            crate::metrics::kv_spill_miss_recompute();
-            crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
-            return Ok(());
-        }
+        let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                return Ok(());
+            }
+        };
         crate::kv_spill::finalize_header(&mut buf, tokens);
         match st.put_prebuilt(key, self.spill_rank, buf) {
             Ok(bytes) => {
-                for v in self.spill_pol.put(key, bytes, tokens) {
+                let snap = crate::kv_spill::Snap {
+                    conv: key,
+                    bytes,
+                    tokens,
+                    fixed,
+                    ck_c: c0,
+                    ck: cks.iter().map(|(p, k, _)| (*p, *k)).collect(),
+                };
+                for v in self.spill_pol.put_snap(snap) {
                     st.remove(v, self.spill_rank);
+                }
+                if !self.spill_pol.contains(key) {
+                    // SPILLDUR2: the cost-weighted cap refused the entrant (admitting it would displace a deeper
+                    // snapshot) — delete the file the writer has queued/landed rather than orphan it
+                    st.remove(key, self.spill_rank);
+                    crate::drprintln!("[kv-spill] capture not kept: admitting {tokens} tokens would evict deeper snapshots");
                 }
                 crate::metrics::kv_spill_write(bytes, tokens);
             }
@@ -506,10 +581,82 @@ impl Exl3Scheduler {
             return Ok(None);
         }
         let st = self.spill.clone().unwrap();
-        let Some((conv, _)) = self.spill_pol.lookup(key, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
+        let c = self.chunk.max(1);
+        // SPILLTRUNC: the lookup picks the restore shape from replicated policy state only — Full (the prompt
+        // extends the snapshot) or Trunc (the snapshot is deeper; resume at its deepest provable carried
+        // checkpoint q <= prompt depth). Under TP both come out identical on every rank (tokens + policy state).
+        let Some(hit) = self.spill_pol.lookup_at(key, c, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
             crate::metrics::kv_spill_miss_recompute();
             return Ok(None);
         };
+        let conv = hit.conv();
+        // SPILLDUR (server.log): the capture at handover is ASYNC — the session's next request often arrives
+        // seconds after the eviction, while its multi-GiB capture is still in the writer queue (the policy entry
+        // is registered at enqueue, so lookup hits a file that does not exist yet: silent miss, 162 s re-prefill
+        // measured). Join the write: one condvar wait bounded by the cost model's own headroom (the wait plus the
+        // read must stay cheaper than the re-prefill — `wait_budget_secs`, hard-capped at SPILL_WAIT_MAX_SECS),
+        // then read. Past the budget proceed with the miss exactly as before. Skipped under TP — captures there
+        // go through put_sync at the lockstep point, so the queue is always empty and no rank branches on
+        // live-queue state (the SpillFlag agree below is untouched).
+        if self.tp.is_none() && st.is_pending(conv) {
+            let (priced, saved) = match hit {
+                crate::kv_spill::Hit::Full { n, bytes, .. } =>
+                    (bytes.max((n as u64) * crate::kv_spill::KV_BYTES_PER_TOKEN), n as u64),
+                crate::kv_spill::Hit::Trunc { q, read_bytes, .. } => (read_bytes, q as u64),
+            };
+            let budget = self.spill_pol.wait_budget_secs(priced, saved, crate::kv_spill::NVME_READ_BPS,
+                                                         crate::kv_spill::PREFILL_TPS);
+            let t0 = std::time::Instant::now();
+            let joined = st.await_durable(conv, budget);
+            let us = t0.elapsed().as_micros() as u64;
+            crate::metrics::kv_spill_durability_wait(us, joined);
+            crate::drprintln!("[kv-spill] capture still queued (conv {conv:016x}, {priced} bytes): waited {} ms, \
+                               joined={joined} (budget {budget:.2} s)", us / 1000);
+        }
+        if let crate::kv_spill::Hit::Trunc { n, .. } = hit {
+            // SPILLTRUNC: only spans are read — the engine wants the inner header, the 0..q prefix of each row
+            // region, the table, and the consumed checkpoint (never the snapshot's state planes or hist, which
+            // describe depth n and are never read). The engine re-runs the proof (deepest q <= prompt depth with
+            // conv_key(prompt[..q]) matching the table) itself; the rows a failed truncated restore may have
+            // half-written are harmless: the fallback re-prefill rewrites them.
+            let want = key.len();
+            let rdres = self.model.spill_trunc_restore(slot, key, c, &mut |off: u64, len: usize| -> Result<Vec<u8>> {
+                st.read_at(conv, self.spill_rank, 36 + off, len)
+                    .map_err(|e| anyhow::anyhow!("span read at {off}+{len}: {e}"))
+            });
+            // TP: the Ok/Err outcome is agreed before ANY install, exactly like the full path's parse agree.
+            let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(rdres.is_ok())) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => anyhow::bail!("kv spill: truncated-restore agree failed slot={slot}: {e:#}"),
+                None => rdres.is_ok(),
+            };
+            if !all_ok {
+                let why = rdres.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                crate::dreprintln!("[kv-spill] truncated restore dropped: conv {conv:016x} slot={slot} \
+                                    rank={} ({why}) - dropped on all ranks, re-prefill", self.spill_rank);
+                self.spill_pol.remove(conv);
+                st.remove(conv, self.spill_rank);
+                crate::metrics::kv_spill_restore_peer_miss();
+                return Ok(None);
+            }
+            let (q, ck) = match rdres {
+                Ok(v) => v,
+                Err(e) => anyhow::bail!("kv spill: truncated restore failed slot={slot} ({e:#}) after the \
+                                         cross-rank agree — ranks would diverge"),
+            };
+            if let Some(s16) = self.wp16.as_mut() {
+                // the lane adopts the snapshot's lineage up to q and resumes under WP16 discipline from the
+                // carried checkpoint — the prefill reads the lane rows 0..q and continues at q
+                s16.install(slot, c, &key[..q], q, ck);
+            }
+            self.spill_pol.remove(conv);
+            st.remove(conv, self.spill_rank);
+            crate::metrics::kv_spill_hit(q as u64);
+            crate::drprintln!("[exl3-serve] kv spill: truncated restore slot={slot}: rows 0..{q} + carried \
+                               checkpoint of a {n}-token snapshot ({want}-token prompt; priced {} MiB)",
+                              hit.read_bytes() >> 20);
+            return Ok(Some(q));
+        }
         // LANERES3 (TP>=2): the lookup and cost model are pure replicated state (identical
         // on every rank); the local read's outcome is agreed with one SpillFlag, so a
         // snapshot only ONE rank can read is dropped on BOTH (counted) and both re-prefill

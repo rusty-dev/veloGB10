@@ -500,14 +500,24 @@ impl FwdModel {
     /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL, payload version SPILL_PAYLOAD_VERSION):
     /// 8B magic, u32 version, u64 tokens, u64 region count, u64 payload bytes, the raw regions
     /// in spill_regions order, then the 2 host PLE ring ids. Bit-exact by construction: every
-    /// region is a memcpy of the exact device words the serving path reads. TEXT-ONLY: the
-    /// per-slot VIS rope rows are not spilled — an image-slot restore re-prefills (counted on
-    /// /metrics); agent traces are text. D2H runs on the NULL stream through a reused pinned
+    /// region is a memcpy of the exact device words the serving path reads. IMAGE PROMPTS INCLUDED (PFXPOOL4
+    /// note, 2026-11-22 — the old "TEXT-ONLY" claim was never enforced and is wrong about the engine): the
+    /// per-slot VIS rope rows are NOT part of any cache payload because they are per-REQUEST state — admit arms
+    /// them (vision_setup) for the full incoming prompt before any restore, and RoPE rotation is baked into the
+    /// K rows at write, so the row slab ports unchanged between lanes. D2H runs on the NULL stream through a reused pinned
     /// staging chunk (the PinnedHost pattern, WP05): the compute stream is synchronized first
     /// so the planes' writers retire, then chunked copies run (~5 GB/s on .13, ~0.1 s per
     /// 0.5-GiB snapshot). Evictions are rare and the admission round is dominated by the next
     /// conversation's prefill; the DISK write is the async part (kv_spill::Store writer thread).
-    pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>) -> Result<()> {
+    /// SPILLTRUNC: `ck_c` + `cks` (ascending (position, prefix_key, checkpoint)) are the lane's WP16 checkpoints
+    /// for THIS conversation (Wp16::ckpts_under + kv_spill::prefix_keys); they ride the file in the section the
+    /// payload format gained at version 6, so a later prompt that is a TRUNCATED prefix of `tokens` can resume at
+    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are a
+    /// few tens of MB against GiB of rows, and they are D2H-copied through the same pinned staging as regions.
+    /// Returns `fixed`: the file bytes that do NOT scale with rows (both headers + the state planes + hist + the
+    /// checkpoint section) — kv_spill::Policy::trunc_read prices a truncated restore with it.
+    pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>, ck_c: u32,
+                         cks: &[(u64, u64, &RecurCkpt)]) -> Result<u64> {
         let snap = self.snap.as_ref().context("prefix snapshots not allocated")?;
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
@@ -523,7 +533,8 @@ impl FwdModel {
         // path is rare + dominated by the next prefill.
         self.dsync()?;
         const CHUNK: usize = 64 << 20;
-        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(16)))?;
+        let ck_b = cks.first().map_or(self.ckpt_layout().bytes(), |(_, _, c)| c.spill_bytes());
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(ck_b).max(16)))?;
         for (src, bytes) in &regions {
             let mut left = *bytes;
             let mut at = *src;
@@ -536,7 +547,7 @@ impl FwdModel {
                 left -= n;
             }
         }
-        // the inner body header the restore parses (magic, ver=1, tokens, nreg, total):
+        // the inner body header the restore parses (magic, ver, tokens, nreg, total):
         out[36..44].copy_from_slice(b"GB10SPIL");
         out[44..48].copy_from_slice(&SPILL_PAYLOAD_VERSION.to_le_bytes());
         out[48..56].copy_from_slice(&(tokens as u64).to_le_bytes());
@@ -545,7 +556,39 @@ impl FwdModel {
         let h = snap.hist.lock().unwrap();
         out.extend_from_slice(&h[slot * 2].to_le_bytes());
         out.extend_from_slice(&h[slot * 2 + 1].to_le_bytes());
-        Ok(())
+        // SPILLTRUNC section: trailer, table, then the checkpoint words (table order). The grid `ck_c` records
+        // the chunk width they were taken at: Wp16::resume_point only honors a checkpoint store built at THIS
+        // run's width, so a capture from a foreign grid is stored honestly and simply never offered (lookup_at).
+        let nck = cks.len() as u64;
+        let snap_bytes: u64 = {
+            let k = self.pool_n_snap()?;
+            regions[regions.len().saturating_sub(k)..].iter().map(|(_, b)| *b as u64).sum()
+        };
+        let fixed: u64 = 36 + 36 + snap_bytes + 8 + crate::kv_spill::CK_TRAILER_BYTES
+            + nck * (crate::kv_spill::CK_TABLE_ENTRY_BYTES + ck_b as u64); // leading 36 = the outer kv header
+        out.extend_from_slice(&(cks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ck_c.to_le_bytes());
+        out.extend_from_slice(&fixed.to_le_bytes());
+        for (pos, key, ck) in cks {
+            out.extend_from_slice(&pos.to_le_bytes());
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&ck.hist()[0].to_le_bytes());
+            out.extend_from_slice(&ck.hist()[1].to_le_bytes());
+        }
+        for (_, _, ck) in cks {
+            let (at0, bytes) = ck.spill_span();
+            let mut left = bytes;
+            let mut at = at0;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                pin.dtoh(0, at, n)?;
+                self.dsync()?;
+                out.extend_from_slice(pin.as_bytes(0, n));
+                at += n as u64;
+                left -= n;
+            }
+        }
+        Ok(fixed)
     }
 
     /// LANERES2: restore a spill_capture payload into `slot`. The position planes go to the
@@ -573,7 +616,14 @@ impl FwdModel {
         let tokens = u64::from_le_bytes(bytes[12..20].try_into()?) as usize;
         let nreg = u64::from_le_bytes(bytes[20..28].try_into()?) as usize;
         let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
-        anyhow::ensure!(bytes.len() == 36 + total + 8, "spill: payload length mismatch");
+        // SPILLTRUNC: the v6 checkpoint section after the hist tail must match THIS model's checkpoint size
+        anyhow::ensure!((total as u64).saturating_add(36 + 8 + 16) <= bytes.len() as u64,
+                        "spill: missing checkpoint-section trailer");
+        let nck = u32::from_le_bytes(bytes[36 + total + 8..36 + total + 12].try_into()?) as usize;
+        anyhow::ensure!(bytes.len() as u64
+            == 36u64 + total as u64 + 8 + 16
+            + (nck as u64) * (crate::kv_spill::CK_TABLE_ENTRY_BYTES + self.ckpt_bytes()),
+                        "spill: payload length mismatch");
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
         anyhow::ensure!(regions.len() == nreg, "spill: region count {} != {nreg}", regions.len());
@@ -613,6 +663,105 @@ impl FwdModel {
         h[slot * 2] = h0;
         h[slot * 2 + 1] = h1;
         Ok(tokens)
+    }
+
+    /// SPILLTRUNC: restore a snapshot DEEPER than the incoming prompt at the deepest carried checkpoint
+    /// `q <= want`. Payload bytes arrive through `read` (payload-relative spans — the pool wires them to
+    /// `kv_spill::Store::read_at`): only the inner header, each ROW region's 0..q prefix, the checkpoint table
+    /// and the ONE consumed checkpoint are ever read; the snapshot's state planes and hist describe depth n and
+    /// are NOT usable at q, so a truncated restore is rows + carried checkpoint — never the snapshot's own state
+    /// (which regions survive truncation, as demanded: every positional row plane YES; conv/S/PLE/carry/hist at
+    /// n NO — the checkpoint at q replaces them, installed via `ckpt_restore` by the WP16 resume that picks up
+    /// the caller's `Wp16::install`). `prompt` is the incoming prompt: the engine redoes the FULL proof itself
+    /// (`0 < pos <= prompt.len()` and `conv_key(prompt[..pos]) ==` the table's key — kv_spill::conv_key, the same
+    /// FNV the capture wrote), never trusting the caller's decision — and resumes at the deepest proven q. The
+    /// policy ran the identical proof on the identical tokens, so both land on the same q by construction.
+    /// Returns (q, checkpoint at q incl. its host PLE pair). Any Err = fall back to a plain miss (never a failed
+    /// round; under TP the Ok/Err outcome rides the SpillFlag agree BEFORE anything is installed, so the ranks
+    /// stay identical). The lane's rows 0..q are already written when Ok is returned.
+    pub fn spill_trunc_restore(&self, slot: usize, prompt: &[u32], c: usize,
+                               read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<(usize, RecurCkpt)> {
+        let want = prompt.len();
+        let hdr = read(0, 36)?;
+        anyhow::ensure!(&hdr[0..8] == b"GB10SPIL", "spill-trunc: bad magic");
+        let ver = u32::from_le_bytes(hdr[8..12].try_into()?);
+        anyhow::ensure!(ver == SPILL_PAYLOAD_VERSION, "spill-trunc: payload version {ver}");
+        let tokens = u64::from_le_bytes(hdr[12..20].try_into()?) as usize;
+        let nreg = u64::from_le_bytes(hdr[20..28].try_into()?) as usize;
+        let total = u64::from_le_bytes(hdr[28..36].try_into()?) as usize;
+        anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill-trunc: tokens {tokens} out of range");
+        anyhow::ensure!(want < tokens, "spill-trunc: want {want} >= snapshot depth {tokens} (that is a full restore)");
+        let regions_n = self.spill_regions(slot, tokens)?;
+        anyhow::ensure!(regions_n.len() == nreg, "spill-trunc: region count {} != {nreg}", regions_n.len());
+        anyhow::ensure!(total as u64 == regions_n.iter().map(|(_, b)| *b as u64).sum::<u64>(),
+                        "spill-trunc: payload bytes {total} != this model's regions (flags/model changed)");
+        let ck_b = self.ckpt_bytes() as usize;
+        let troff = 36 + total + 8;
+        let tr = read(troff as u64, 16)?;
+        let nck = u32::from_le_bytes(tr[0..4].try_into()?) as usize;
+        let ck_c = u32::from_le_bytes(tr[4..8].try_into()?) as usize;
+        anyhow::ensure!(ck_c == c && ck_c > 0, "spill-trunc: carried grid C={ck_c}, this run uses C={c}");
+        const CKE: usize = crate::kv_spill::CK_TABLE_ENTRY_BYTES as usize; // (pos, prefix key, hist pair)
+        let tab = read((troff + 16) as u64, nck.checked_mul(CKE).ok_or_else(|| anyhow::anyhow!("spill-trunc: nck absurd"))?)?;
+        let mut q = 0usize;
+        let mut qi = usize::MAX;
+        let mut hist = [0i32; 2];
+        for i in 0..nck {
+            let e = &tab[i * CKE..i * CKE + CKE];
+            let pos = u64::from_le_bytes(e[0..8].try_into()?) as usize;
+            let key = u64::from_le_bytes(e[8..16].try_into()?);
+            if pos > 0 && pos <= want && pos > q && crate::kv_spill::conv_key(&prompt[..pos]) == key {
+                q = pos;
+                qi = i;
+                hist = [i32::from_le_bytes(e[16..20].try_into()?), i32::from_le_bytes(e[20..24].try_into()?)];
+            }
+        }
+        anyhow::ensure!(q > 0, "spill-trunc: no carried checkpoint at-or-below {want}");
+        let regions_q = self.spill_regions(slot, q)?;
+        anyhow::ensure!(regions_q.len() == regions_n.len(), "spill-trunc: region count changed with depth");
+        let nsnap = self.pool_n_snap()?;
+        self.dsync()?;
+        const CHUNK: usize = 64 << 20;
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(ck_b).max(16)))?;
+        // rows only: every row region starts at its plane's row 0 at any depth, so the file's region-i span at
+        // its n-depth offset, cut to the q-depth size, is exactly rows 0..q of that plane
+        let mut off_n = 36usize;
+        for i in 0..regions_n.len().saturating_sub(nsnap) {
+            let (dst, bytes_n) = regions_n[i];
+            let bytes_q = regions_q[i].1;
+            anyhow::ensure!(bytes_q <= bytes_n && regions_q[i].0 == dst, "spill-trunc: region {i} changed with depth");
+            let (mut left, mut at, mut soff) = (bytes_q, dst, off_n);
+            while left > 0 {
+                let n = left.min(CHUNK);
+                let b = read(soff as u64, n)?;
+                anyhow::ensure!(b.len() == n, "spill-trunc: short span at {soff}");
+                pin.copy_from_slice(0, &b);
+                pin.htod(0, at, n)?;
+                self.dsync()?;
+                at += n as u64;
+                soff += n;
+                left -= n;
+            }
+            off_n += bytes_n;
+        }
+        // the consumed checkpoint: upload into a fresh buffer + carry its host PLE pair; the WP16 resume branch
+        // (prefill) installs it over the lane exactly like any other checkpoint resume
+        let mut ck = self.ckpt_alloc()?;
+        anyhow::ensure!(ck.spill_bytes() == ck_b, "spill-trunc: checkpoint size changed since capture");
+        let cb = read((troff + 16) as u64 + (nck as u64) * (CKE as u64) + (qi as u64) * (ck_b as u64), ck_b)?;
+        anyhow::ensure!(cb.len() == ck_b, "spill-trunc: short checkpoint span");
+        let (mut left, mut at, mut soff) = (ck_b, ck.spill_span().0, 0usize);
+        while left > 0 {
+            let n = left.min(CHUNK);
+            pin.copy_from_slice(0, &cb[soff..soff + n]);
+            pin.htod(0, at, n)?;
+            self.dsync()?;
+            at += n as u64;
+            soff += n;
+            left -= n;
+        }
+        ck.set_hist(hist);
+        Ok((q, ck))
     }
 
     fn copy_slot_state(&self, slot: usize, psc: &PrefillScratch, save: bool) -> Result<()> {

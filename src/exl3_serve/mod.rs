@@ -98,6 +98,17 @@ enum PoolHit { Full(usize, bool), Ckpt(usize) }
 /// PFXPOOL: prompts shorter than this are not kept in the pool (reading them again costs about what a copy does).
 const POOL_MIN_TOKENS: usize = 256;
 
+/// VIS-2: the cache-key id of an image row — pixel hash + intra-span index; ids >= 2^31 never collide with a
+/// vocabulary id (only the cache tiers compare them). Determinism is the contract ALL image-prompt cache tiers
+/// stand on — the own-lane snapshot, the spill tier and the prefix pool all compare these ids: the SAME image at
+/// the SAME span position re-renders the SAME ids across turns (a grown conversation keeps earlier spans put),
+/// and any different image id-mismatches at its first row, so a resume never lands deeper than it can prove.
+/// PFXPOOL4: kept as one function so the pool's unit tests prove exactly what `vision_setup` puts in the key.
+pub(crate) fn image_row_key(pixel_hash: u64, j: usize) -> u32 {
+    let hh = (pixel_hash as u32) ^ ((pixel_hash >> 32) as u32);
+    0x8000_0000 | (hh.wrapping_add((j as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF)
+}
+
 /// PFXPOOL2: an entry reads its leading rows from an older entry when they share at least this many (fewer are
 /// cheaper to keep than to chain), through at most this many ancestors (each one is a copy per plane at restore).
 const POOL_SHARE_MIN: usize = 1024;
@@ -928,3 +939,9 @@ mod tp_preflight_tests;
 
 #[cfg(test)]
 mod copy_span_arm_tests;
+
+/// PFXPOOL4 (2026-11-22): the image-prompt cache-tier contract — image row-key stability across turns, mrope
+/// position/delta prefix-stability under prompt growth (what makes a restored image row byte-correct in another
+/// lane), and pool lookup/best depth on image keys (never deeper than the provable prefix).
+#[cfg(test)]
+mod image_pool_tests;

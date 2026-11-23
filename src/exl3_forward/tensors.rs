@@ -326,8 +326,11 @@ pub(super) fn gdn_tc_min_rows() -> usize {
 /// planes are carried too); 5 = issue #41 (the pooled QSA key planes are captured at the kernels' lane stride: a
 /// version-4 file written by a lane other than 0 with max_pos % ratio != 0 holds that lane's pooled blocks shifted).
 /// Files of another version are dropped at the restore check (graceful re-prefill); version-1 files held 1/4 of each
-/// f32 and 1/2 of each u16 per-slot plane.
-pub(crate) const SPILL_PAYLOAD_VERSION: u32 = 5;
+/// f32 and 1/2 of each u16 per-slot plane. SPILLTRUNC bumped 5 -> 6: the payload gained the checkpoint section
+/// after the hist tail (nck, grid C, fixed-bytes, the (pos, prefix-key, hist) table, and the ckpt words themselves)
+/// so a prompt that is a TRUNCATED prefix of a snapshot can resume at a carried boundary. The section format and
+/// version live in `kv_spill` (the boot scanner validates exactly what the restore accepts).
+pub(crate) const SPILL_PAYLOAD_VERSION: u32 = crate::kv_spill::SPILL_PAYLOAD_VERSION;
 
 /// One slot's region of a `[width x per_slot]` device plane: (byte address, byte length). `elems` = the plane's
 /// element count, `elem_bytes` = size_of the element type (ISSUES 122: the stride must be in BYTES).

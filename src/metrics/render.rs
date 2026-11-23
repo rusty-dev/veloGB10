@@ -413,6 +413,9 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_prefill_interleave_points_total {}\n", PREFILL_INTERLEAVE_POINTS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_hits_total {}\n", KV_SPILL_HITS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_misses_recompute_total {}\n", KV_SPILL_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_waits_total {}\n", KV_SPILL_DURABILITY_WAITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_joins_total {}\n", KV_SPILL_DURABILITY_JOINS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_durability_wait_us_total {}\n", KV_SPILL_DURABILITY_WAIT_US.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_capture_peer_drop_total {}\n", KV_SPILL_CAPTURE_PEER_DROPS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_restore_peer_miss_total {}\n", KV_SPILL_RESTORE_PEER_MISSES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_bytes {}\n", KV_SPILL_BYTES.load(Relaxed)));

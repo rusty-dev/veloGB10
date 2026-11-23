@@ -728,7 +728,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let d = if ks_mode == "auto" { "/tmp/gb10_kv_spill".to_string() } else { ks_mode.clone() };
         (true, d)
     };
-    let (spill_store, spill_pol) = if spill_on {
+    let (spill_store, mut spill_pol) = if spill_on {
         let st = crate::kv_spill::Store::spawn_with(std::path::PathBuf::from(&spill_dir),
             std::cmp::min(std::cmp::max((ks_gb << 30) / 4, 4 << 30), 6 << 30))
             .map_err(|e| anyhow::anyhow!("kv-spill: cannot create {spill_dir}: {e}"))?;
@@ -740,10 +740,32 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let tp_note = if tp_rank.is_some() {
             "; TP: per-rank local shards, capture/restore agreed across ranks in-round"
         } else { "" };
-        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text-only snapshots; restores when the NVMe read beats the re-prefill it replaces){tp_note}", tp_rank.unwrap_or(0))
+        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text and image prompts; waits briefly for a capture still in the writer queue; restores when the NVMe read beats the re-prefill it replaces){tp_note}", tp_rank.unwrap_or(0))
     } else {
         "[exl3-serve] kv spill: off (the default; --kv-spill auto or a directory turns it on)".to_string()
     });
+    // SPILLGC (2026-11-22): self-clean the spill directory at boot. The Policy starts EMPTY every boot and the
+    // store never looked at its own directory, so snapshots from previous boots were invisible to the cap
+    // forever (measured: 182 GiB / 99 files under --kv-spill-gb 32, the oldest predating several restarts; every
+    // restart could add another ~cap of untracked bytes). Scan THIS rank's files now, before serving: adopt the
+    // header-valid ones into the policy (a restore right after boot hits them), delete the malformed ones and
+    // this rank's stale writer temps, and cap the adopted total NOW in SPILLDUR2 order (ascending depth: the
+    // deep sessions are kept, the cheap-to-re-read shallow ones swept first) with the victims' files deleted.
+    // Same-dir coexistence is adopt-then-cap: names claiming another rank are never touched, a same-rank sharer
+    // joins this cap through adoption. Under TP a per-rank adoption forks the replicated policy only if the
+    // ranks' file sets diverge manually — capture-agree keeps them equal by construction (a failed write drops
+    // the key everywhere) and the restore-side SpillFlag agrees every read; a one-file divergence aborts loudly
+    // at the first divergent restore (SpillFlag mismatch) rather than silently forking the KV.
+    if let Some(st) = &spill_store {
+        let scan = st.boot_scan(tp_rank.unwrap_or(0) as usize, model.max_pos() as u64, model.ckpt_bytes());
+        let rep = st.boot_finish(&mut spill_pol, tp_rank.unwrap_or(0) as usize, scan);
+        if rep.adopted + rep.swept + rep.evicted > 0 {
+            const GIB: f64 = (1u64 << 30) as f64;
+            crate::rprintln!("[exl3-serve] kv spill: boot sweep (rank {}): adopted {} snapshots ({:.1} GiB), swept {} garbage files ({:.1} GiB), cap-evicted {} ({:.1} GiB)",
+                tp_rank.unwrap_or(0), rep.adopted, rep.adopted_bytes as f64 / GIB,
+                rep.swept, rep.swept_bytes as f64 / GIB, rep.evicted, rep.evicted_bytes as f64 / GIB);
+        }
+    }
     // PFXPOOL: --prefix-pool-gb N (Spmd: identical on every rank) — prompt states kept in device memory across lanes;
     // --prefix-pool-floor-gb F: the MemAvailable every rank keeps (a capture that would go below it evicts, then is
     // dropped). Off with --prefix-cache off (no snapshots to keep) or N = 0.
@@ -757,7 +779,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let free = crate::memwatch::mem_available_bytes().map_or("?".to_string(), |b| format!("{:.1}", b as f64 / (1u64 << 30) as f64));
         let per_k = model.pool_entry_bytes(1024).map(|b| b as f64 / (1u64 << 20) as f64).unwrap_or(0.0);
         format!("[exl3-serve] prefix pool: on, up to {pool_gb} GiB of prompt states shared by all lanes (keeps {pool_floor_gb} GiB \
-                 free; {free} GiB free now; ~{per_k:.0} MiB per 1K-token prompt on this rank; text-only; --prefix-pool-gb 0 = off)")
+                 free; {free} GiB free now; ~{per_k:.0} MiB per 1K-token prompt on this rank; text and image prompts; --prefix-pool-gb 0 = off)")
     } else if !prefix_on {
         "[exl3-serve] prefix pool: off (--prefix-cache off)".to_string()
     } else {

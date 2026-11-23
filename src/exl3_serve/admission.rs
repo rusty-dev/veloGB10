@@ -24,11 +24,10 @@ impl Exl3Scheduler {
         let mut key = req.prompt.clone();
         let mut off = 0usize;
         for sp in &req.image_spans {
-            let hh = (sp.pixel_hash as u32) ^ ((sp.pixel_hash >> 32) as u32);
             for j in 0..sp.num_tokens {
                 src[sp.start + j] = (off + j) as i32;
                 // ids >= 2^31 never collide with a vocabulary id; only the cache compares them
-                key[sp.start + j] = 0x8000_0000 | (hh.wrapping_add((j as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF);
+                key[sp.start + j] = image_row_key(sp.pixel_hash, j);
             }
             off += sp.num_tokens;
         }

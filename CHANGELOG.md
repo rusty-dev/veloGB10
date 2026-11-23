@@ -1,3 +1,62 @@
+## Unreleased — cache-tier fixes: spill durability join, image-prompt pool, cost-weighted retention
+
+Three fixes behind the measured single-lane failure (server.log 2026-11-22): a 551-token helper request took the
+only lane between two turns of a 215k-token session; the session's state was still in the spill writer's queue
+(~3.9 GiB, `pending`) when the next request arrived seconds later, the restore lookup hit policy state but no file
+yet — a silent miss and a 162 s re-prefill (1326 tok/s) — while the prefix pool skipped the session outright
+(image prompts: `captures=1 skips=8`) and both tiers could evict a deep session entry for a small helper purely by
+age.
+
+- **SPILLDUR — durability join** (`src/kv_spill.rs`, `src/exl3_serve/pool.rs`): the store now tracks the conv keys
+  still in the writer queue; a restore whose lookup hits one JOINS the write — one condvar wait bounded by the
+  cost model's own headroom (wait + read must stay cheaper than the re-prefill), hard-capped at 5 s
+  (`SPILL_WAIT_MAX_SECS`), then reads. Past the budget the miss proceeds as before. Single-rank only: TP captures
+  are written synchronously at the existing lockstep agree, so no rank branches on live-queue state. Counted on
+  `/metrics` (`velogb10_kv_spill_durability_{waits,joins}_total`, `wait_us_total`).
+- **PFXPOOL4 — image-bearing prompts enter the pool** (`src/exl3_serve/pool.rs`, `admission.rs`, `mod.rs`): the
+  "text only" capture skip was wrong about the engine — per-slot vision RoPE is per-REQUEST state (admit arms it
+  for the full new prompt before any restore) and rotation is baked into rows at write, so image rows port across
+  lanes exactly like the spill tier ships them today; key identity (pixel-hash + intra-span index, now the shared
+  `image_row_key`) keeps the resume never deeper than it can prove. A re-render that drops or moves the images
+  falls back to a shallower checkpoint or a plain pre-prefill.
+- **PFXPOOL3 / SPILLDUR2 — cost-weighted retention** (`src/prefix_pool.rs`, `src/kv_spill.rs`): neither tier
+  evicts a deeper entry to admit a shallower one. Victim order is ascending re-prefill cost (tokens; bytes only as
+  the tiebreak, then LRU stamp/id), and a capture whose room can only come from DEEPER entries is refused outright
+  — newcomer not kept, tier untouched. The memory-floor paths stay LRU (they survive pressure, not an entrant).
+  A refused spill capture's file is deleted rather than orphaned.
+
+- **SPILLGC — the spill store self-cleans at boot** (`src/kv_spill.rs`, `src/exl3_serve/builder.rs`): the
+  `Policy` starts empty every boot and the store never looked at its own directory, so snapshots from previous
+  boots were invisible to the cap forever — measured 182 GiB / 99 files under `--kv-spill-gb 32`, the oldest
+  predating several restarts. Before serving, the builder scans THIS rank's files: header-valid ones are ADOPTED
+  into the policy (a restore right after boot hits them), malformed ones (junk header, truncated/padded, tokens
+  out of range, stale writer temps) are deleted, and the adopted total is capped NOW in SPILLDUR2 order —
+  ascending depth, so the deep sessions survive and the cheap-to-re-read shallow ones are swept, victims' files
+  deleted through the writer queue. Files naming another rank are never touched (same-dir coexistence is
+  adopt-then-cap). One boot line reports it: `kv spill: boot sweep (rank N): adopted … swept … cap-evicted …`.
+
+- **SPILLTRUNC — a deeper snapshot is a truncated hit, not a miss** (`src/kv_spill.rs`, `src/exl3_forward/slot_state.rs`,
+  `src/exl3_forward/tensors.rs`, `src/exl3_forward/wp16.rs`, `src/exl3_serve/pool.rs`): a prompt that is a TRUNCATED
+  prefix of a captured snapshot (regenerate/branch a session: 214 641-token snapshot vs a 214 355-token re-render) used
+  to be an unconditional miss — `[kv-spill] miss: snapshot n=… vs prompt.len()=…` — and the whole 215k re-prefilled.
+  The spill payload (version 6) now carries the lane's WP16 checkpoints for the captured conversation: the (position,
+  prefix-key, hist) table plus the checkpoint words (tens of MB against GiB of rows). A lookup matches
+  `conv_key(prompt[..q])` against the replicated table — the only proof available that the incoming prompt is a true
+  prefix — and prices the read at `fixed + bytes_for(q)` (the row prefixes + exactly the consumed checkpoint; the
+  snapshot's state planes/hist describe depth n and are never read). The restore copies rows 0..q, uploads the
+  checkpoint, and `Wp16::install`s it so the prefill resumes at q; proof rules: q <= prompt depth, q > own-lane q,
+  the key matches, and the carried grid equals this run's chunk width. Boot validates the section, SPILLGC adopts
+  pre-existing files through the same parser. The truncated-vs-full decision reads replicated policy state only
+  (tokens + table), so TP ranks pick the same target without a new agree; the read outcome still rides SpillFlag.
+
+No HTTP behavior change; a cache-tier error still never fails a round. New unit tests:
+`lookup_joins_pending_capture`, `cost_weighted_cap_never_evicts_deeper`, `wait_budget_is_the_cost_model_headroom`
+(kv_spill); `cost_weighted_make_room_refuses_the_cheaper_entrant`,
+`cost_weighted_make_room_evicts_ascending_and_takes_families_together` (prefix_pool); `image_pool_tests`
+(row-key stability, mrope prefix-stability, pool depth on image keys); `boot_adopts_preexisting_snapshots`,
+`boot_sweeps_garbage_keeps_foreign`, `boot_cap_sweeps_ascending_keeps_deep`, `boot_empty_dir_is_silent`
+(kv_spill, SPILLGC).
+
 ## v0.7.10 — source-tree split, Qwen3.6 vision-tower fix, template compatibility
 
 A maintenance release. The large source files that had grown monolithic over the
